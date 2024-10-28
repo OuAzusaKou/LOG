@@ -26,21 +26,21 @@ def get_response(message, contexts, history_messages):
         base_url="https://api.openai-proxy.org/v1",
     )
     messages = [
-        {'role': 'system', 'content': '你是一个名叫小Q的故事RAG问答系统。你应该准确回应用户的消息，确保回答在context中存在，如果context中不存在，请用中文回复"对不起，我无法回答这个问题"。始终用中文回复。其中context中是故事相关的信息。'},
+        {'role': 'system', 'content': '你是一个名叫小Q的故事RAG问答系统。你应该准确回应用户的消息，请只回答问题，而不需要其他解释。确保回答在context中存在相关信息，如果context中不存在相关信息，请用中文回复"对不起，我无法回答这个问题"。始终用中文回复。其中context中是故事相关的信息。'},
     ]
     messages.extend(history_messages)
-    messages.append({'role': 'user', 'content': str({'context': contexts, 'message': message})})
+    messages.append({'role': 'user', 'content': str({'context': contexts, '问题': message})})
     
     completion = client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4o",
         messages=messages
     )
     return completion.choices[0].message.content
 
-def find_top_k_similar(embeddings, query_vector, top_k=5):
+def find_top_k_similar(embeddings, query_vector, top_k=5, embeddings_path='./story_analysis_embedding_bge'):
     similarities = []
     for embedding in embeddings:
-        vector = load_npy_vector(os.path.join('./chat_analysis_embedding_bge', embedding + '.npy'))
+        vector = load_npy_vector(os.path.join(embeddings_path, embedding + '.npy'))
         similarity = cosine_similarity([query_vector], [vector])[0][0]
         similarities.append((embedding, similarity))
     similarities.sort(key=lambda x: x[1], reverse=True)
@@ -104,6 +104,8 @@ def save_chat_record(message, response):
 def get_chat_history(history, max_history=10):
     return [{"role": "user" if i % 2 == 0 else "assistant", "content": msg} 
             for i, msg in enumerate(history)]
+
+
 
 def main():
     json_file_path = 'chat_analysis_emb.json'

@@ -22,13 +22,14 @@ Thumbs.db
 *.tmp
 *.swp
 
-/chat_record_file
+/chat_record_file/*
 
-/human_chart
+/human_chart/*
 
-/chat_analysis_embedding_bge
+/chat_analysis_embedding_bge/*
+/story_analysis_embedding_bge/*
 
-/bge-m3
+/bge-m3/*
 
 /img_record_file
 

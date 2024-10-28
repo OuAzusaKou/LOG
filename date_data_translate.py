@@ -27,15 +27,16 @@ def sort_and_organize_data(data):
     for date, records in data['daily_records'].items():
         for record in records:
             for person, info_list in record.items():
-                for info in info_list:
-                    info_date = parse_date(info['date'], date)
-                    organized_data[info_date].append({
-                        'person': person,
-                        'date': info['date'],  # 保留原始日期字符串
-                        'location': info['location'],
-                        'events': info['events'],
-                        'relationships': info['relationships']
-                    })
+                if person != '原文':        
+                    for info in info_list:
+                        info_date = parse_date(info['date'], date)
+                        organized_data[info_date].append({
+                            'person': person,
+                            'date': info['date'],  # 保留原始日期字符串
+                            'location': info['location'],
+                            'events': info['events'],
+                            'relationships': info['relationships']
+                    })  
     
     # 按日期排序
     sorted_data = dict(sorted(organized_data.items()))

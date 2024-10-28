@@ -11,58 +11,61 @@ def load_npy_vector(npy_path):
 def create_graph_from_json(json_file_path, graph_image_path, graph_json_path, adjacency_matrix_path):
     # 加载JSON数据
     with open(json_file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+        data = json.load(f)['daily_records']
 
     # 创建图
     G = nx.Graph()
 
     # 创建时刻节点并连接相邻时刻
-    dates = sorted(data.keys())
-    for i, date in enumerate(dates):
-        if date != "overall_relationships":
-            G.add_node(date, type='时刻', info=data[date])
-            if i > 0:
-                prev_date = dates[i-1]
-                if prev_date != "overall_relationships":
-                    G.add_edge(prev_date, date)
-                    G.add_edge(date, prev_date)  # 添加双向连接
+    # dates = sorted(data.keys())
+    # for i, date in enumerate(dates):
+    #     if date != "overall_relationships":
+    #         G.add_node(date, type='时刻', info=data[date])
+    #         if i > 0:
+    #             prev_date = dates[i-1]
+    #             if prev_date != "overall_relationships":
+    #                 G.add_edge(prev_date, date)
+    #                 G.add_edge(date, prev_date)  # 添加双向连接
 
     # 创建人物、地点和事件节点,并连接到相应的时刻节点
     for date, events in data.items():
         if date != "overall_relationships":
-            for event in events:
-                # 添加人物节点
-                person = event['person']
-                if not G.has_node(person):
-                    embedding_path = os.path.join('./chat_analysis_embedding_bge', person + '.npy')
-                    G.add_node(person, type='人物', info=embedding_path)
-                G.add_edge(person, date)
-                G.add_edge(date, person)  # 添加双向连接
+            for person_,event in events[0].items():
+                if person_ != '原文':
+                    # 添加人物节点
+                    person = person_
+                    for entry in event:
+                        G.add_node(entry['date'], type='时刻', info=entry['embeddings'][0])
+                        if not G.has_node(person):
+                            embedding_path = os.path.join('./chat_analysis_embedding_bge', person + '.npy')
+                            G.add_node(person, type='人物', info=embedding_path)
+                        G.add_edge(person, entry['date'])
+                        G.add_edge(entry['date'], person)  # 添加双向连接
                 
-                # 添加地点节点
-                if event['location']:
-                    location = event['location']
-                    if not G.has_node(location):
-                        embedding_path = os.path.join('./chat_analysis_embedding_bge', 'location_' + location + '.npy')
-                        G.add_node(location, type='地点', info=embedding_path)
-                    G.add_edge(location, date)
-                    G.add_edge(date, location)  # 添加双向连接
+                    # 添加地点节点
+                        if entry['location']:
+                            location = entry['location']
+                            if not G.has_node(location):
+                                embedding_path = os.path.join('./chat_analysis_embedding_bge', 'location_' + location + '.npy')
+                                G.add_node(location, type='地点', info=embedding_path)
+                            G.add_edge(location, entry['date'])
+                            G.add_edge(entry['date'], location)  # 添加双向连接
                 
                 # 添加事件节点
-                for e in event['events']:
-                    if not G.has_node(e):
-                        embedding_path = os.path.join('./chat_analysis_embedding_bge', 'event_' + e + '.npy')
-                        G.add_node(e, type='事件', info=embedding_path)
-                    G.add_edge(e, date)
-                    G.add_edge(date, e)  # 添加双向连接
-                
-                # 连接人物节点
-                for rel, info in event['relationships'].items():
-                    if not G.has_node(rel):
-                        embedding_path = os.path.join('./chat_analysis_embedding_bge', rel + '.npy')
-                        G.add_node(rel, type='人物', info=embedding_path)
-                    G.add_edge(person, rel, relation=info['关系'])
-                    G.add_edge(rel, person, relation=info['关系'])  # 添加双向连接
+                        for e in entry['events']:
+                            if not G.has_node(e):
+                                embedding_path = os.path.join('./chat_analysis_embedding_bge', 'event_' + e + '.npy')
+                                G.add_node(e, type='事件', info=embedding_path)
+                            G.add_edge(e, entry['date'])
+                            G.add_edge(entry['date'], e)  # 添加双向连接
+                        
+                    # 连接人物节点
+                        for rel, info in entry['relationships'].items():
+                            if not G.has_node(rel):
+                                embedding_path = os.path.join('./chat_analysis_embedding_bge', rel + '.npy')
+                                G.add_node(rel, type='人物', info=embedding_path)
+                            G.add_edge(person, rel, relation=info['关系'])
+                            G.add_edge(rel, person, relation=info['关系'])  # 添加双向连接
 
     # 合并相似的“地点”型节点
     merge_similar_nodes(G, '地点', data)
@@ -90,7 +93,7 @@ def create_graph_from_json(json_file_path, graph_image_path, graph_json_path, ad
     print(f"图结构已保存为 {graph_json_path}")
     print(f"邻接矩阵已保存为 {adjacency_matrix_path}")
 
-def merge_similar_nodes(G, node_type, data, similarity_threshold=0.8):
+def merge_similar_nodes(G, node_type, data, similarity_threshold=0.8, embedding_folder='./story_analysis_embedding_bge'):
     # 获取所有指定类型的节点
     nodes = [node for node, attr in G.nodes(data=True) if attr['type'] == node_type]
     
@@ -99,14 +102,14 @@ def merge_similar_nodes(G, node_type, data, similarity_threshold=0.8):
         for node2 in nodes[i+1:]:
             # 加载节点的嵌入向量
             if node_type == '地点':
-                node1_address = os.path.join('./chat_analysis_embedding_bge', 'location_' + node1 + '.npy')
-                node2_address = os.path.join('./chat_analysis_embedding_bge', 'location_' + node2 + '.npy')
+                node1_address = os.path.join(embedding_folder, 'location_' + node1 + '.npy')
+                node2_address = os.path.join(embedding_folder, 'location_' + node2 + '.npy')
             elif node_type == '事件':
-                node1_address = os.path.join('./chat_analysis_embedding_bge', 'event_' + node1 + '.npy')
-                node2_address = os.path.join('./chat_analysis_embedding_bge', 'event_' + node2 + '.npy')
+                node1_address = os.path.join(embedding_folder, 'event_' + node1 + '.npy')
+                node2_address = os.path.join(embedding_folder, 'event_' + node2 + '.npy')
             else:
-                node1_address = os.path.join('./chat_analysis_embedding_bge', node1 + '.npy')
-                node2_address = os.path.join('./chat_analysis_embedding_bge', node2 + '.npy')
+                node1_address = os.path.join(embedding_folder, node1 + '.npy')
+                node2_address = os.path.join(embedding_folder, node2 + '.npy')
             node1_vector = load_npy_vector(node1_address)
             node2_vector = load_npy_vector(node2_address)
             

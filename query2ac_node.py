@@ -4,7 +4,7 @@ import re
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from json2adjmatrix import json2adj
+# from json2adjmatrix import json2adj
 # from snn_graph_query_20240801.snn_active import active_node
 
 def load_json(file_path):
