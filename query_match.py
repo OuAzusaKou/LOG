@@ -75,30 +75,26 @@ def get_top_3_matches(query, json_data, encoder_model,query_analysis_system):
 
     # Example usage
     start_nodes = top_3_entity_matches_set  # Replace with your starting node IDs
+    
     k = 1  # Number of steps
 
-    visited_nodes,paths = bfs_k_steps_with_paths(graph_structure, start_nodes, k)
+    visited_nodes, paths = bfs_k_steps_with_paths(graph_structure, start_nodes, k)
 
-    # # 获取相应的文本
-    # matched_texts = []
-    # for matches in top_3_entity_matches_set:
-    #     for embedding, _ in matches:
-    #         for date, entries in json_data['daily_records'].items():
-    #             for person_entries in entries:
-    #                 for person, person_entries in person_entries.items():
-    #                     if person != '原文':
-    #                         for entry in person_entries:
-    #                             if embedding in entry['embeddings']:
-    #                                 context = f"日期: {entry['date']}\n"
-    #                                 context += f"人物: {entry['person']}\n"
-    #                                 context += f"地点: {entry['location']}\n"
-    #                                 context += f"事件: {', '.join(entry['events'])}\n"
-    #                                 for rel, details in entry['relationships'].items():
-    #                                     context += f"与{rel}的关系: {details['关系']}, 互动: {details['互动']}\n"
-    #                                 matched_texts.append(context)
-    #                                 break
+    # 获取相应的文本
+    original_texts = []
     
-    return visited_nodes,paths
+    for chapter, records in json_data['daily_records'].items():
+        found = False
+        for node in visited_nodes:
+            for record in records:
+                if node in record:
+                    original_texts.append(record['原文'])
+                    found = True
+                    break
+            if found:
+                break
+
+    return visited_nodes, paths, original_texts
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+from http import client
 import os
 import json
 import ssl
@@ -7,6 +8,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
 from datetime import datetime
 from collections import deque
+
+from query_analysis import QueryAnalysisSystem
+import query_match
+# from story_analysis_system import StoryAnalysisSystem
 
 def load_json(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -26,7 +31,7 @@ def get_response(message, contexts, history_messages):
         base_url="https://api.openai-proxy.org/v1",
     )
     messages = [
-        {'role': 'system', 'content': '你是一个名叫小Q的故事RAG问答系统。你应该准确回应用户的消息，请只回答问题，而不需要其他解释。确保回答在context中存在相关信息，如果context中不存在相关信息，请用中文回复"对不起，我无法回答这个问题"。始终用中文回复。其中context中是故事相关的信息。'},
+        {'role': 'system', 'content': '你是一个名叫小Q的故事RAG问答系统。你应该准确回应用户的消息，请只回答问题，而不需要其他解释。确保回答在context中存在相关信息。始终用中文回复。其中context中是故事相关的信息。'},
     ]
     messages.extend(history_messages)
     messages.append({'role': 'user', 'content': str({'context': contexts, '问题': message})})
@@ -36,6 +41,26 @@ def get_response(message, contexts, history_messages):
         messages=messages
     )
     return completion.choices[0].message.content
+
+
+def extract_key_information_with_ai(paths, original_texts, client):
+    # 遍历paths，从original_texts中提取关键信息
+    key_information_list = []
+    for path in paths:
+        messages = [
+            {'role': 'system', 'content': f'请根据以下\'关键词\'和\'原文\'，提取出与关键词相关的关键信息。只提取与关键词相关的信息，而不需要其他的任何文字，回答在50字'},
+        ]
+        # messages.extend(history_messages)
+        messages.append({'role': 'user', 'content': str({'关键词': path, '原文': original_texts})})
+        
+        completion = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+        key_information = completion.choices[0].message.content
+        key_information_list.append(key_information)
+    return ('\n').join(key_information_list)
+
 
 def find_top_k_similar(embeddings, query_vector, top_k=5, embeddings_path='./story_analysis_embedding_bge'):
     similarities = []
@@ -87,6 +112,10 @@ def get_context(question, json_data, encoder_model, top_k=10):
     
     return contexts
 
+def get_context_by_query_match(query,json_data,encoder_model,query_analysis_system,top_k=10):
+    original_texts = query_match.get_top_3_matches(query, json_data, encoder_model,query_analysis_system)
+    return original_texts
+
 def save_chat_record(message, response):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     chat_record = f"""时间戳：{timestamp}
@@ -114,6 +143,13 @@ def main():
 
     print("欢迎来到故事RAG系统！输入'退出'结束对话。")
 
+    client = OpenAI(
+        api_key="sk-EjTppzE0xnr61QCj0d0MrZREohrwbV8xoMvOlvpw35g61vVG",
+        base_url="https://api.openai-proxy.org/v1",
+    )
+
+    chat_folder = 'human_chart'
+    query_analysis_system = QueryAnalysisSystem(chat_folder, client, encoder_model)
     chat_history = deque(maxlen=20)  # 存储最近20条消息(10轮对话)
 
     while True:
@@ -121,9 +157,14 @@ def main():
         if message.lower() == '退出':
             break
 
-        contexts = get_context(message, json_data, encoder_model)
+        # contexts = get_context(message, json_data, encoder_model)
+        visited_nodes, paths, original_texts = get_context_by_query_match(message, json_data, encoder_model, query_analysis_system)
+        
+        # 使用AI接口提取关键信息
+        key_information = extract_key_information_with_ai(paths, original_texts, client)
+        
         history_messages = get_chat_history(chat_history)
-        response = get_response(message, contexts, history_messages)
+        response = get_response(message, key_information, history_messages)
 
         print(f'小Q：{response}\n')
         # save_chat_record(message, response)

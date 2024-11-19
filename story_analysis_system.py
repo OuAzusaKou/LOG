@@ -2,6 +2,7 @@ import os
 import json
 from datetime import datetime
 from collections import defaultdict
+from neo4j import GraphDatabase
 import numpy as np
 from openai import OpenAI
 
@@ -10,13 +11,41 @@ from date_data_translate import date_translate
 
 from FlagEmbedding import BGEM3FlagModel
 
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+
 class StoryAnalysisSystem:
-    def __init__(self, chat_folder, client, encoder_model):
+    def __init__(self, chat_folder, client, encoder_model,neo4j_driver):
         self.chat_folder = chat_folder
         self.client = client
         self.daily_records = {}
         self.overall_relationships = defaultdict(dict)
         self.encoder_model = encoder_model
+        self.driver = neo4j_driver
+        self.collection_name = 'story_analysis'
+        self.qdrant_client = QdrantClient("localhost", port=6333)
+        self.init_qdrant_collection()
+    def init_qdrant_collection(self):
+        collections = self.qdrant_client.get_collections().collections
+        existing_collections = [collection.name for collection in collections]
+
+        if self.collection_name not in existing_collections:
+            print(f"创建新集合: {self.collection_name}")
+            self.qdrant_client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=1024,  # 向量维度
+                    distance=models.Distance.COSINE  # 距离度量方式
+                )
+            )
+        else:
+            print(f"集合 {self.collection_name} 已存在，跳过创建步骤")
+
+    def reset_all_database(self):
+        self.qdrant_client.delete_collection(self.collection_name)
+        self.init_qdrant_collection()
+        self.driver.execute_query("MATCH (n) DETACH DELETE n")
+
     def analyze_chats(self):
         for filename in os.listdir(self.chat_folder):
             if filename.endswith('.txt'):
@@ -107,7 +136,7 @@ class StoryAnalysisSystem:
             messages=[
                 {"role": "system", "content": f"""你是一个专业的'故事'数据分析助手。需要根据'故事'来分析出文本中出现的角色的：日期，现在和过去所在地点，事件，和角色的关系。\\
                  注意如果无法推测现在或者过去所在地点则为空。注意'故事'中可能包含多个角色，时间，地点，事件，关系。不要出现\'\\\'符号
-                 请用严格按照以下格式返回JSON,严格包含'date','location','events','relationships'四个键值对，请根据上下文尽量推断出年份，无法推断时请用空代替。: 
+                 请用严格按照以下格式返回JSON,严格包含'date','location','events','relationships'四个键值对，请根据上下文尽量推断出年份，无法推断时用空代替。: 
                  {{"阿里巴巴"：[{{
                      "date": "2024-07-01",
                      "location": "北京",
@@ -314,6 +343,202 @@ class StoryAnalysisSystem:
             json.dump(data, file, ensure_ascii=False, indent=4)
 
         print(f"完成！修改后的 JSON 数据已保存到 {json_path}，embedding 已保存到 {embedding_folder} 文件夹")
+    
+    def check_similar_vectors(self, vector, collection_name):
+        search_result = self.qdrant_client.search(
+            collection_name=collection_name,
+            query_vector=vector,
+            limit=1024,
+            score_threshold=0.9
+        )
+        return search_result[0] if search_result else None
+
+    def get_embedding_and_add_to_qdrant(self, node_type, content):
+        node_embeddings = self.encoder_model.encode(content)['dense_vecs']
+        node_match = self.check_similar_vectors(node_embeddings, self.collection_name)
+        if not node_match:
+            # 使用绝对值确保ID为正数
+            point_id = abs(hash(f"{node_type}_{content}")) % (2**63 - 1)  # 确保ID在64位无符号整数范围内
+            self.qdrant_client.upsert(
+                collection_name=self.collection_name,
+                points=models.Batch(
+                    ids=[point_id],  # 添加正整数ID
+                    vectors=[node_embeddings],
+                    payloads=[{"type": node_type, "value": content}]
+                )
+            )
+            return content, node_embeddings
+        else:
+            return node_match.payload['value'], node_embeddings
+
+    def add_content_to_database(self,chat_content):
+    
+        analysis_result = self.client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": f"""你是一个专业的'故事'数据分析助手。需根据'故事'来分析出文本中出现的角色的：日期，现在和过去所在地点，事件，和角色的关系。\\
+                    注意如果无法推测现在或者过去所在地点则为空。注意'故事'中可能包含多个角色，时间，地点，事件，关系。不要出现\'\\\'符号
+                    请用严格按照以下格式返回JSON,严格包含'date','location','events','relationships'四个键值对，请根据上下文尽量推断出年份，无法推断时请用空代替。: 
+                    {{"阿里巴巴"：[{{
+                        "date": "2024-07-01",
+                        "location": "北京",
+                        "events": ["在北京创立阿里巴巴"],
+                        "relationships": {{
+                            "张三": {{"关系": "母子", "互动": "讨论工作"}},
+                            "李四": {{"关系": "朋友", "互动": "一起吃饭"}}
+                        }}
+                    }},
+                    {{
+                        "date": "2024-06-01",
+                        "location": "无锡",
+                        "events": ["去旅行，吃了醉蟹，吃了西湖醋鱼，和朋友拍下了决定历史的照片"],
+                        "relationships": {{
+                            "张三": {{"关系": "母子", "互动": "讨论工作"}},
+                            "李四": {{"关系": "朋友", "互动": "一起吃饭"}}
+                        }}
+                    }}
+                    ]，
+                    "张三"：[{{"date":"2024-07-01",
+                        "location": "商场",
+                        "events": ["与同事开会，并记录了决定历史的一刻"],
+                        "relationships": {{
+                            "李四": {{"关系": "朋友", "互动": "一起吃饭"}}
+                        }}}},
+                    {{"date":"2024-03-02",
+                        "location": "外面",
+                        "events": ["逛了逛商场，买了个手机，买了个电脑，买了个平板"],
+                        "relationships": {{
+                            "李四": {{"关系": "朋友", "互动": "一起吃饭"}}
+                        }}}}，
+                    ],
+                    "李四"：[{{"date":"2024-07-01",
+                        "location": "电话亭",
+                        "events": ["打电话给朋友约饭，并拍下了决定历史的照片"],
+                        "relationships": {{
+                            "张三": {{"关系": "朋友", "互动": "一起吃饭"}}
+                        }}}},
+                    {{"date":"2024-03-02",
+                        "location": "南京",
+                        "events": ["找了个旅馆，美美得睡了一觉"],
+                        "relationships": {{
+                            "阿里巴巴": {{"关系": "朋友", "互动": "一起吃饭"}}
+                        }}}}，
+                    ]
+                    
+                    }}"""
+                    },
+
+                {"role": "user", "content": f"""'故事'：{chat_content}"""}
+            ],
+            response_format={
+                "type": "json_object"
+            }
+        )
+        analysis_result = json.loads(analysis_result.choices[0].message.content)
+        
+        for person, records in analysis_result.items():
+
+            person_match,person_embeddings = self.get_embedding_and_add_to_qdrant('person',person)
+
+            for record in records:
+                location = record['location']
+                events = record['events']
+                relationships = record['relationships']
+                
+
+                
+                location_match,location_embeddings = self.get_embedding_and_add_to_qdrant('location',location)
+
+                events_embeddings_list = []
+                events_match_list = []
+                for event in events:
+                    event_match,event_embeddings = self.get_embedding_and_add_to_qdrant('event',event)
+                    events_embeddings_list.append(event_embeddings)
+                    events_match_list.append(event_match)
+
+                date_match,date_embeddings = self.get_embedding_and_add_to_qdrant('date',record['date'])
+
+                relationships_embeddings_list = []
+                per_embeddings_list = []
+                per_match_list = []
+                relationships_match_list = []
+                for per,rel_info in relationships.items():
+                    rel_match,rel_embeddings = self.get_embedding_and_add_to_qdrant('relation',rel_info['关系'])
+                    relationships_embeddings_list.append(rel_embeddings)
+                    relationships_match_list.append(rel_match)
+                    per_match,per_embeddings = self.get_embedding_and_add_to_qdrant('person',per)
+                    per_embeddings_list.append(per_embeddings)
+                    per_match_list.append(per_match)
+                # Neo4j数据库操作
+                with self.driver.session() as session:
+                    # 使用实际的或匹配到的节点ID
+                    location_id = location_match
+                    person_id = person_match
+                    date_id = date_match
+
+                    # 创建节点和关系的Cypher查询保持不变
+                    create_nodes_query = """
+                    MERGE (n:Node:Location {id: $id_1})
+                    MERGE (m:Node:Person {id: $id_2})
+                    MERGE (n)-[:地点]-(m)
+                    RETURN n, m
+                    """
+                    
+                    session.run(create_nodes_query, 
+                            id_1=location_id,
+                            id_2=person_id)
+                    
+                    create_nodes_query = """
+                    MERGE (n:Node:Location {id: $id_1})
+                    MERGE (m:Node:Time {id: $id_2})
+                    MERGE (n)-[:时刻]-(m)
+                    RETURN n, m
+                    """
+                    
+                    session.run(create_nodes_query, 
+                            id_1=location_id,
+                            id_2=date_id)
+                    
+                    create_nodes_query = """
+                    MERGE (n:Node:Person {id: $id_1})
+                    MERGE (m:Node:Time {id: $id_2})
+                    MERGE (n)-[:时刻]-(m)
+                    RETURN n, m
+                    """
+                    
+                    session.run(create_nodes_query, 
+                            id_1=person_id,
+                            id_2=date_id)
+                    
+                    for event_id in events_match_list:
+                        create_nodes_query = """
+                        MERGE (n:Node:Person {id: $id_1})
+                        MERGE (m:Node:Event {id: $id_2})
+                        MERGE (n)-[:事件]-(m)
+                        RETURN n, m
+                        """
+                        session.run(create_nodes_query, 
+                            id_1=person_id,
+                            id_2=event_id)
+                    for rel_person, relation_id in zip(per_match_list,relationships_match_list):
+                        create_nodes_query = """
+                        MERGE (n:Node:Person {id: $id_1})
+                        MERGE (m:Node:Person {id: $id_2})
+                        MERGE (n)-[r:RELATIONSHIP {type: $rel_type}]-(m)
+                        RETURN n, m
+                        """
+                        session.run(create_nodes_query, 
+                            id_1=person_id,
+                            id_2=rel_person,
+                            rel_type=relation_id)
+
+        analysis_result['原文'] = chat_content
+
+                    
+        # if self.daily_records.get(str(date)) is None:
+        #     self.daily_records[str(date)] = [analysis_result]
+        # else:
+        #     self.daily_records[str(date)].append(analysis_result)
 
 
 def setup_models():
@@ -325,16 +550,30 @@ if __name__ == '__main__':
     import ssl
 
     ssl._create_default_https_context = ssl._create_unverified_context
-    os.environ['HTTP_PROXY'] = 'http://192.168.224.76:7890'
-    os.environ['HTTPS_PROXY'] = 'http://192.168.224.76:7890'
-
+    os.environ['HTTP_PROXY'] = 'http://192.168.224.76:8960'
+    os.environ['HTTPS_PROXY'] = 'http://192.168.224.76:8960'
+    # os.environ['HTTP_PROXY'] = 'http://192.168.11.166:7890'
+    # os.environ['HTTPS_PROXY'] = 'http://192.168.11.166:7890'
+    os.environ['NO_PROXY'] = 'localhost'
+    
     client = OpenAI(
-        api_key="sk-EjTppzE0xnr61QCj0d0MrZREohrwbV8xoMvOlvpw35g61vVG", # 如果您没有配置环境变量，请��此处用您的API Key进行替换
+        api_key="sk-EjTppzE0xnr61QCj0d0MrZREohrwbV8xoMvOlvpw35g61vVG", # 如果您没有配置环境变量，请此处用您的API Key进行替换
         base_url="https://api.openai-proxy.org/v1",  # 填写DashScope服务的base_url
     )
+    
+    uri = "bolt://localhost:7687"  # Neo4j默认地址和端口
+    user = "neo4j"                 # 默认用户名
+    password = "12345678"     # 你的密码
+
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+
+
     chat_folder = 'human_chart'
     encoder_model = setup_models()
-    analyzer = StoryAnalysisSystem(chat_folder, client,encoder_model)
+    analyzer = StoryAnalysisSystem(chat_folder, client,encoder_model,driver)
+    analyzer.reset_all_database()
+    analyzer.add_content_to_database('阿里巴巴和马云在东京打败了四十大盗。')
+    analyzer.add_content_to_database('哈利波特和马云在伦敦坐火车喝茶。')
     # analyzer.analyze_chats()
 
     # results = analyzer.get_results()
@@ -348,13 +587,13 @@ if __name__ == '__main__':
     # analyzer.check_analysis_result()
 
     
-    # 执行日期翻译
-    date_translate()
+    # # 执行日期翻译
+    # date_translate()
     
-    # 处理聊天分析到嵌入
-    json_path = 'sorted_chat_analysis_results.json'
-    model_type = 'bgem3'  # 可以是 'bgem3' 或 'piccolo' 或 'bce'
-    process_chat_analysis_to_embeddings(json_path, model_type)
+    # # 处理聊天分析到嵌入
+    # json_path = 'sorted_chat_analysis_results.json'
+    # model_type = 'bgem3'  # 可以是 'bgem3' 或 'piccolo' 或 'bce'
+    # process_chat_analysis_to_embeddings(json_path, model_type)
     
     # 处理图片数据
     from image_processor import ImageProcessor
