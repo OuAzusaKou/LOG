@@ -7,6 +7,7 @@ import numpy as np
 from openai import OpenAI
 
 from chat_analysis_to_embeddings import process_chat_analysis_to_embeddings
+from data_input.video_input import read_video_segment
 from date_data_translate import date_translate
 
 from FlagEmbedding import BGEM3FlagModel
@@ -14,15 +15,21 @@ from FlagEmbedding import BGEM3FlagModel
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
+from image_embedding.split_video import detect_scene_changes, extract_key_frames, save_key_frames
+
 class StoryAnalysisSystem:
-    def __init__(self, chat_folder, client, encoder_model,neo4j_driver):
+    def __init__(self, chat_folder, client, encoder_model, neo4j_driver, collection_name='story_analysis'):
         self.chat_folder = chat_folder
         self.client = client
         self.daily_records = {}
         self.overall_relationships = defaultdict(dict)
         self.encoder_model = encoder_model
+        
+        
+        # 使用story_analysis数据库连接
         self.driver = neo4j_driver
-        self.collection_name = 'story_analysis'
+        
+        self.collection_name = collection_name
         self.qdrant_client = QdrantClient("localhost", port=6333)
         self.init_qdrant_collection()
     def init_qdrant_collection(self):
@@ -213,9 +220,6 @@ class StoryAnalysisSystem:
                         #     # 这里可以添加更复杂的逻辑来更新关系
                         #     self.overall_relationships[per+'_'+person]['最近互动'] = f"{date}: {info['互动']}"
 
-    def summarize_overall_relationships(self):
-        # 这里可以添加更复杂的逻辑来总结整体关系
-        pass
 
     def get_results(self):
         return {
@@ -353,6 +357,24 @@ class StoryAnalysisSystem:
         )
         return search_result[0] if search_result else None
 
+    def add_graph_embedding_to_qdrant(self,graph_address,embeddings):
+        node_match = self.check_similar_vectors(embeddings, self.collection_name)
+        if not node_match:
+            # 使用绝对值确保ID为正数
+            point_id = abs(hash(f"graph_{graph_address}")) % (2**63 - 1)  # 确保ID在64位无符号整数范围内
+            self.qdrant_client.upsert(
+                collection_name=self.collection_name,
+                points=models.Batch(
+                    ids=[point_id],  # 添加正整数ID
+                    vectors=[embeddings],
+                    payloads=[{"type": 'graph', "value": graph_address}]
+                )
+            )
+            return graph_address, embeddings
+        else:
+            return node_match.payload['value'], embeddings
+        
+
     def get_embedding_and_add_to_qdrant(self, node_type, content):
         node_embeddings = self.encoder_model.encode(content)['dense_vecs']
         node_match = self.check_similar_vectors(node_embeddings, self.collection_name)
@@ -371,8 +393,7 @@ class StoryAnalysisSystem:
         else:
             return node_match.payload['value'], node_embeddings
 
-    def add_content_to_database(self,chat_content):
-    
+    def entity_relation_extract(self,chat_content):
         analysis_result = self.client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -435,7 +456,30 @@ class StoryAnalysisSystem:
             }
         )
         analysis_result = json.loads(analysis_result.choices[0].message.content)
+        return analysis_result
+    
+    def add_entity_to_neo4j(self,entity_name_1,entity_name_2,entity_type_1,entity_type_2,relation_type):
+        with self.driver.session() as session:
+
+            # 创建节点和关系的Cypher查询保持不变
+            create_nodes_query = f"""
+            MERGE (n:Node:{entity_type_1} {id: $id_1})
+            MERGE (m:Node:{entity_type_2} {id: $id_2})
+            MERGE (n)-[:{relation_type}]-(m)
+            RETURN n, m
+            """
+            
+            session.run(create_nodes_query, 
+                    id_1=entity_name_1,
+                    id_2=entity_name_2)
+    
+    def add_content_to_database(self,chat_content):
+
+        analysis_result = self.entity_relation_extract(chat_content)
         
+
+        content_match,content_embeddings = self.get_embedding_and_add_to_qdrant('content',chat_content)
+
         for person, records in analysis_result.items():
 
             person_match,person_embeddings = self.get_embedding_and_add_to_qdrant('person',person)
@@ -531,6 +575,18 @@ class StoryAnalysisSystem:
                             id_1=person_id,
                             id_2=rel_person,
                             rel_type=relation_id)
+                        
+                    content_id = content_match
+                    create_nodes_query = """
+                    MERGE (n:Node:Content {id: $id_1})
+                    MERGE (m:Node:Time {id: $id_2})
+                    MERGE (n)-[:原文]-(m)
+                    RETURN n, m
+                    """
+                    session.run(create_nodes_query, 
+                            id_1=content_id,
+                            id_2=date_id)
+                    
 
         analysis_result['原文'] = chat_content
 
@@ -539,6 +595,135 @@ class StoryAnalysisSystem:
         #     self.daily_records[str(date)] = [analysis_result]
         # else:
         #     self.daily_records[str(date)].append(analysis_result)
+
+
+
+    def query_embedding_match(self,query_vector,top_k=5,score_threshold=0.5):
+        search_result = self.qdrant_client.search(
+            collection_name=self.collection_name,
+            query_vector=query_vector,
+            limit=top_k,
+            score_threshold=score_threshold
+        )
+        #根据返回向量结果找到相应的neo4j节点
+        node_ids = [result.payload['value'] for result in search_result]
+        return search_result,node_ids
+    
+    def bfs_k_steps_with_paths(self, start_node, k):
+        """
+        使用BFS算法在Neo4j中搜索从起始节点开始k步内可达的所有节点和路径
+        
+        Args:
+            driver: Neo4j驱动
+            start_node: 起始节���ID
+            k: 最大步数
+        
+        Returns:
+            包含所有路径的列表
+        """
+        query = """
+        MATCH path = (start:Node {id: $start_id})-[*1..{k}]-(end:Node)
+        WHERE start <> end
+        RETURN path
+        """
+        
+        with self.driver.session() as session:
+            result = session.run(query, start_id=start_node, k=k)
+            paths = []
+            
+            for record in result:
+                path = record['path']
+                path_info = {
+                    'nodes': [],
+                    'relationships': []
+                }
+                
+                # 提取路径中的节点信息
+                for node in path.nodes:
+                    node_info = {
+                        'id': node['id'],
+                        'labels': list(node.labels)
+                    }
+                    path_info['nodes'].append(node_info)
+                
+                # 提取路径中的关系信息
+                for rel in path.relationships:
+                    rel_info = {
+                        'type': rel.type,
+                        'start_node': rel.start_node['id'],
+                        'end_node': rel.end_node['id']
+                    }
+                    if 'type' in rel:  # 如果关系有type属性
+                        rel_info['relation_type'] = rel['type']
+                    path_info['relationships'].append(rel_info)
+                
+                paths.append(path_info)
+                
+            return paths
+
+    def bfs_k_steps(self, start_nodes, k):
+        """
+        对多个起始节点执行k步BFS搜索
+        
+        Args:
+            start_nodes: 起始节点ID列表
+            k: 最大步数
+        
+        Returns:
+            包含所有路径的字典，以起始节点为键
+        """
+        results = {}
+        for start_node in start_nodes:
+            paths = self.bfs_k_steps_with_paths(start_node, k)
+            results[start_node] = paths
+            
+            # 打印搜索结果的摘要
+            print(f"\n从节点 {start_node} 开始的 {k} 步搜索结果:")
+            print(f"找到 {len(paths)} 条路径")
+            for i, path in enumerate(paths, 1):
+                print(f"\n路径 {i}:")
+                print(f"节点: {' -> '.join([node['id'] for node in path['nodes']])}")
+                print(f"关系: {' -> '.join([rel['type'] for rel in path['relationships']])}")
+        
+        return results
+    
+    def qwen_image(self, image_path):
+        # 读取图片文件为base64格式
+        import base64
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        # 使用OpenAI的vision模型进行图片理解
+        response = self.client.chat.completions.create(
+            model="gpt-4o-mini",  # 使用支持图像的模型
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        },
+                    
+                        {
+                            "type": "text", 
+                            "text": "请分析这张图片的内容。"
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000
+        )
+        
+        try:
+            # 解析返回的JSON结果
+            result = response.choices[0].message.content
+            return result
+        except json.JSONDecodeError:
+            # 如果返回结果不是有效的JSON格式，返回原始文本
+            return {"error": "无法解析图片分析结果", "raw_response": response.choices[0].message.content}
 
 
 def setup_models():
@@ -565,15 +750,50 @@ if __name__ == '__main__':
     user = "neo4j"                 # 默认用户名
     password = "12345678"     # 你的密码
 
-    driver = GraphDatabase.driver(uri, auth=(user, password))
-
+    # 首先创建一个默认的驱动实例
+    driver = GraphDatabase.driver(uri, database='story', auth=(user, password))
 
     chat_folder = 'human_chart'
     encoder_model = setup_models()
     analyzer = StoryAnalysisSystem(chat_folder, client,encoder_model,driver)
     analyzer.reset_all_database()
-    analyzer.add_content_to_database('阿里巴巴和马云在东京打败了四十大盗。')
-    analyzer.add_content_to_database('哈利波特和马云在伦敦坐火车喝茶。')
+
+    frames, fps = read_video_segment(
+        video_path="./data_input/agan.mp4",
+        start_time=2.0,
+        end_time=10.0
+    )
+    
+    scene_changes = detect_scene_changes(frames,0.99999)
+
+    key_frames = extract_key_frames(frames, scene_changes)
+
+    save_key_frames(key_frames, './key_frames')
+
+    for root, dirs, files in os.walk('./key_frames'):
+        for file in files:
+            result_img = analyzer.qwen_image(os.path.join(root, file))
+
+            analyzer.add_content_to_database(result_img)
+
+            print(result_img)
+
+
+    #
+
+
+
+    # print(scene_changes)
+
+    # result_img = analyzer.qwen_image('./img_record_file/1644895299_-1599608410_660496424.jpg')
+    # print(result_img)
+    # analyzer.add_content_to_database('阿里巴巴和马云在东京打败了四十大盗。')
+    # analyzer.add_content_to_database('哈利波特和马云在伦敦坐火车喝茶。')
+    
+
+
+
+
     # analyzer.analyze_chats()
 
     # results = analyzer.get_results()
@@ -582,7 +802,7 @@ if __name__ == '__main__':
     # with open('chat_analysis_results.json', 'w', encoding='utf-8') as f:
     #     json.dump(results, f, ensure_ascii=False, indent=2)
 
-    analyzer.process_and_save_embeddings('chat_analysis_results.json', './story_analysis_embedding_bge')
+    # analyzer.process_and_save_embeddings('chat_analysis_results.json', './story_analysis_embedding_bge')
     
     # analyzer.check_analysis_result()
 
@@ -596,24 +816,24 @@ if __name__ == '__main__':
     # process_chat_analysis_to_embeddings(json_path, model_type)
     
     # 处理图片数据
-    from image_processor import ImageProcessor
-    processor = ImageProcessor(client)
-    folder_path = 'img_record_file'
-    image_data = processor.process_image_folder(folder_path)
+    # from image_processor import ImageProcessor
+    # processor = ImageProcessor(client)
+    # folder_path = 'img_record_file'
+    # image_data = processor.process_image_folder(folder_path)
 
-    # 将图片数据保存为JSON文件
-    with open('image_data.json', 'w', encoding='utf-8') as f:
-        json.dump(image_data, f, ensure_ascii=False, indent=4)
+    # # 将图片数据保存为JSON文件
+    # with open('image_data.json', 'w', encoding='utf-8') as f:
+    #     json.dump(image_data, f, ensure_ascii=False, indent=4)
 
-    print("图片处理完成,结果已保存到 image_data.json")
+    # print("图片处理完成,结果已保存到 image_data.json")
 
-    # 整合图片数据到聊天分析
-    from integrate_image_data import integrate_image_data, load_json, save_json
-    chat_data = load_json('chat_analysis_emb.json')
-    encoder_model = BGEM3FlagModel('./bge-m3', use_fp16=True)
-    embedding_folder = './chat_analysis_embedding_bge'
-    os.makedirs(embedding_folder, exist_ok=True)
-    updated_chat_data = integrate_image_data(chat_data, image_data, encoder_model, embedding_folder)
-    save_json(updated_chat_data, 'updated_chat_analysis_emb.json')
+    # # 整合图片数据到聊天分析
+    # from integrate_image_data import integrate_image_data, load_json, save_json
+    # chat_data = load_json('chat_analysis_emb.json')
+    # encoder_model = BGEM3FlagModel('./bge-m3', use_fp16=True)
+    # embedding_folder = './chat_analysis_embedding_bge'
+    # os.makedirs(embedding_folder, exist_ok=True)
+    # updated_chat_data = integrate_image_data(chat_data, image_data, encoder_model, embedding_folder)
+    # save_json(updated_chat_data, 'updated_chat_analysis_emb.json')
 
-    print(f"完成！修改后的JSON数据已保存到updated_chat_analysis_emb.json，图片描述的embedding已保存到{embedding_folder}文件夹")
+    # print(f"完成！修改后的JSON数据已保存到updated_chat_analysis_emb.json，图片描述的embedding已保存到{embedding_folder}文件夹")

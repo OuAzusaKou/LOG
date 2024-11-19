@@ -6,7 +6,7 @@ from FlagEmbedding import BGEM3FlagModel
 import numpy as np
 
 class QueryAnalysisSystem:
-    def __init__(self, chat_folder, client, encoder_model):
+    def __init__(self, client, encoder_model, chat_folder='human_chart'):
         self.chat_folder = chat_folder
         self.client = client
         self.encoder_model = encoder_model
@@ -55,7 +55,7 @@ class QueryAnalysisSystem:
                 "type": "json_object"
             }
         )
-        return analysis_result
+        return analysis_result.choices[0].message.content
     
     def get_embeddings(self, analysis_result):
         entities = analysis_result['entities']
@@ -90,10 +90,10 @@ if __name__ == '__main__':
     # 初始化 bge-m3 模型的编码器
     encoder_model = setup_models()
 
-    query_analysis_system = QueryAnalysisSystem(chat_folder='human_chart', client=client, encoder_model=encoder_model)
+    query_analysis_system = QueryAnalysisSystem(client=client, encoder_model=encoder_model, chat_folder='human_chart')
     while True:
         question = input("请输入问题：")
-        analysis_result = query_analysis_system.extract_entities_and_relationships(question).choices[0].message.content
+        analysis_result = query_analysis_system.extract_entities_and_relationships(question)
         analysis_result = json.loads(analysis_result)
         entity_embeddings, relationship_embeddings = query_analysis_system.get_embeddings(analysis_result)
         print("实体的嵌入：", entity_embeddings)
